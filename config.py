@@ -18,7 +18,7 @@ ONBOARD_LED_CURRENT = 0b01
 SERVO_PIN = 13 
 
 # Measurement positions
-SERVO_CENTER_ANGLE = 90
+SERVO_CENTER_ANGLE = 90 # Center position (degrees)
 SERVO_SWING_DEGREES = 60 # How many degrees left/right the arm moves
 
 # ==========================================
