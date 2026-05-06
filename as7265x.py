@@ -2,6 +2,7 @@
 from machine import Pin, I2C
 import time
 import struct
+import config
 
 class AS7265X:
     ADDRESS = 0x49
@@ -13,6 +14,7 @@ class AS7265X:
 
     CONFIG = 0x04
     INTEGRATION_TIME = 0x05
+    LED_CONFIG = 0x07  # Required for LED control
     DEV_SELECT_CONTROL = 0x4F
 
     POLLING_DELAY_MS = 5
@@ -21,7 +23,10 @@ class AS7265X:
     DEV_VISIBLE = 0x01
     DEV_UV = 0x02
 
-    # Tweak: 16x or 64x is generally best for soil absorption
+    LED_WHITE = 0x00
+    LED_IR = 0x01
+    LED_UV = 0x02
+
     GAIN_1X = 0b00
     GAIN_3_7X = 0b01
     GAIN_16X = 0b10
@@ -29,7 +34,6 @@ class AS7265X:
 
     MEASUREMENT_MODE_6CHAN_CONTINUOUS = 0b10
     
-    # Calibration Registers
     R_G_A_CAL = 0x14
     S_H_B_CAL = 0x18
     T_I_C_CAL = 0x1C
@@ -106,17 +110,38 @@ class AS7265X:
         if (value & 0b00110000) == 0:
             raise OSError("AS7265X slave devices not detected")
 
-        # DATASHEET ADJUSTMENTS: Integration cycles and Gain.
-        # Higher integration = less noise but slower read. 
-        # Default: 100 * 2.8ms = 280ms integration time.
+        # Set up LED brightness from config
+        self.set_bulb_current(config.ONBOARD_LED_CURRENT, self.LED_WHITE)
+        self.disable_bulb(self.LED_WHITE)
+
         self.set_integration_cycles(100) 
-        
-        # Default: 1X Gain. If your white LED isn't bright, raise this to GAIN_16X
-        self.set_gain(self.GAIN_1X)
+        self.set_gain(self.GAIN_16X) # Better gain for soil
         self.set_measurement_mode(self.MEASUREMENT_MODE_6CHAN_CONTINUOUS)
 
         time.sleep_ms(300)
         return True
+
+    # --- LED CONTROL METHODS ---
+    def enable_bulb(self, device):
+        self.select_device(device)
+        value = self.virtual_read_register(self.LED_CONFIG)
+        value |= (1 << 3)
+        self.virtual_write_register(self.LED_CONFIG, value)
+
+    def disable_bulb(self, device):
+        self.select_device(device)
+        value = self.virtual_read_register(self.LED_CONFIG)
+        value &= ~(1 << 3)
+        self.virtual_write_register(self.LED_CONFIG, value)
+
+    def set_bulb_current(self, current, device):
+        self.select_device(device)
+        if current > 0b11: current = 0b11
+        value = self.virtual_read_register(self.LED_CONFIG)
+        value &= 0b11001111
+        value |= (current << 4)
+        self.virtual_write_register(self.LED_CONFIG, value)
+    # ---------------------------
 
     def set_measurement_mode(self, mode):
         value = self.virtual_read_register(self.CONFIG)
@@ -160,7 +185,6 @@ class AS7265X:
             self._sleep_ms(self.POLLING_DELAY_MS)
 
     def read_calibrated_channels(self):
-        """Returns heap-optimized calibrated values."""
         return {
             "A": self.get_calibrated_value(self.R_G_A_CAL, self.DEV_UV),
             "B": self.get_calibrated_value(self.S_H_B_CAL, self.DEV_UV),
@@ -183,7 +207,7 @@ class AS7265X:
         }
 
 class AS7265X_Driver:
-    def __init__(self, i2c_bus=0, scl_pin=22, sda_pin=21, freq=100000, debug=False):
+    def __init__(self, i2c_bus=0, scl_pin=config.I2C_SCL_PIN, sda_pin=config.I2C_SDA_PIN, freq=config.I2C_FREQ, debug=False):
         self.i2c = I2C(i2c_bus, scl=Pin(scl_pin), sda=Pin(sda_pin), freq=freq)
         self.debug = debug
         if AS7265X.ADDRESS not in self.i2c.scan():
@@ -195,5 +219,64 @@ class AS7265X_Driver:
         self.sensor.take_measurements()
         return self.sensor.read_calibrated_channels()
 
-def create_default_driver(debug=False, i2c_bus=0, scl_pin=22, sda_pin=21, freq=100000):
+def create_default_driver(debug=False, i2c_bus=0, scl_pin=config.I2C_SCL_PIN, sda_pin=config.I2C_SDA_PIN, freq=config.I2C_FREQ):
     return AS7265X_Driver(i2c_bus=i2c_bus, scl_pin=scl_pin, sda_pin=sda_pin, freq=freq, debug=debug)
+
+# ==========================================
+# Merged from measuring_types.py
+# ==========================================
+class SoilMeasurementSystem:
+    def __init__(self, driver):
+        self.driver = driver
+        self.sensor = driver.sensor
+        
+        # Memory to store state
+        self.dark_ref = None
+        self.white_ref = None
+        self.sample_data = None
+        self.normalized_data = None
+        
+        self.channels = ['A','B','C','D','E','F','G','H','I','J','K','L','R','S','T','U','V','W']
+        self.wavelengths = [410,435,460,485,510,535,560,585,610,645,680,705,730,760,810,860,900,940]
+
+    def take_dark(self):
+        """Measurement 1: Dark Reference (Sensor LEDs OFF)"""
+        self.sensor.disable_bulb(self.sensor.LED_WHITE)
+        time.sleep_ms(500) # Settle time
+        self.dark_ref = self.driver.read_once()
+        return self.dark_ref
+
+    def take_white(self):
+        """Measurement 2: White Reference (Sensor LED ON)"""
+        self.sensor.enable_bulb(self.sensor.LED_WHITE)
+        time.sleep_ms(500) 
+        self.white_ref = self.driver.read_once()
+        self.sensor.disable_bulb(self.sensor.LED_WHITE) # Turn off immediately
+        return self.white_ref
+
+    def take_sample(self):
+        """Measurement 3: Soil Sample (Sensor LED ON)"""
+        self.sensor.enable_bulb(self.sensor.LED_WHITE)
+        time.sleep_ms(500)
+        self.sample_data = self.driver.read_once()
+        self.sensor.disable_bulb(self.sensor.LED_WHITE)
+        return self.sample_data
+
+    def normalize(self):
+        """Calculate Reflectance: R = (S - D) / (W - D)"""
+        if not (self.dark_ref and self.white_ref and self.sample_data):
+            return False
+            
+        self.normalized_data = {}
+        for ch in self.channels:
+            s = self.sample_data[ch]
+            d = self.dark_ref[ch]
+            w = self.white_ref[ch]
+            
+            denom = w - d
+            if denom == 0:
+                self.normalized_data[ch] = 0.0
+            else:
+                self.normalized_data[ch] = (s - d) / denom
+                
+        return True
